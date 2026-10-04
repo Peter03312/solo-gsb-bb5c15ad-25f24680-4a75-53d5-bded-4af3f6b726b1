@@ -7,8 +7,10 @@ const state = {
   video: null,
   segments: [],
   publications: [],
+  translation: null, // null=未启用轨道；{language, entries:[{segment_id,text,reviewed,revision,stale}]}
   activeSegmentId: null,
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
+  trEditor: null, // { segmentId }
   pollTimer: null,
 };
 
@@ -128,6 +130,7 @@ function renderList() {
           <span>时长 ${fmtTime(v.duration_ms)}</span>
           <span>${v.segment_count} 段</span>
           ${reviewBadge}
+          ${v.translation_language ? `<span class="badge tr">译文 ${esc(v.translation_language)}</span>` : ''}
           ${v.latest_version ? `<span class="badge ok">已发布 v${v.latest_version}</span>` : ''}
         </div>
         <div class="meta" style="margin-top:6px">${esc(v.original_name)}</div>
@@ -192,6 +195,7 @@ async function openVideo(id) {
   state.video = data.video;
   state.segments = data.segments;
   state.publications = data.publications;
+  state.translation = data.translation || null;
   state.activeSegmentId = null;
   render();
   startPolling();
@@ -211,16 +215,20 @@ function anyModalOpen() {
   return !$('editorModal').classList.contains('hidden') ||
          !$('conflictModal').classList.contains('hidden') ||
          !$('importModal').classList.contains('hidden') ||
-         !$('restoreModal').classList.contains('hidden');
+         !$('restoreModal').classList.contains('hidden') ||
+         !$('trModal').classList.contains('hidden') ||
+         !$('trackModal').classList.contains('hidden');
 }
 async function pollRefresh() {
   if (anyModalOpen() || !state.video) return;
   if (document.activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
   try {
     const data = await api(`/api/videos/${state.video.id}`);
-    const changed = JSON.stringify(data.segments.map(stripSeg)) !== JSON.stringify(state.segments.map(stripSeg));
+    const changed = JSON.stringify(data.segments.map(stripSeg)) !== JSON.stringify(state.segments.map(stripSeg)) ||
+                    JSON.stringify(data.translation) !== JSON.stringify(state.translation);
     state.segments = data.segments;
     state.publications = data.publications;
+    state.translation = data.translation || null;
     if (changed) {
       renderSegmentDependent();
       toast('检测到他人的修改，已刷新片段列表');
@@ -254,17 +262,18 @@ function renderDetail() {
 
         <section class="card">
           <div style="display:flex;justify-content:space-between;align-items:center">
-            <h2 style="margin:0">片段列表</h2>
+            <h2 style="margin:0">片段列表${state.translation ? ` <span class="badge tr">译文 ${esc(state.translation.language)}</span>` : ''}</h2>
             <div class="row-actions">
+              <button class="btn small" id="trackBtn">🌐 译文轨道…</button>
               <button class="btn small" id="restoreRangeBtn">↩ 区间恢复…</button>
               <button class="btn small" id="importSrtBtn">⬆ 导入 SRT…</button>
               <button class="btn primary small" id="addBtn">＋ 新增片段</button>
             </div>
           </div>
-          <p class="meta">所有写操作都会携带你当前看到的修订号；修订号过期时服务端拒绝并返回冲突，绝不覆盖他人修改。</p>
+          <p class="meta">所有写操作都会携带你当前看到的修订号；修订号过期时服务端拒绝并返回冲突，绝不覆盖他人修改。${state.translation ? '译文逐段关联原文：原文文字或时间变更会使译文失效，需重新校对。' : ''}</p>
           <div class="side-scroll">
             <table class="seg-table">
-              <thead><tr><th>#</th><th>时间</th><th>文本</th><th>状态</th><th>操作</th></tr></thead>
+              <thead><tr><th>#</th><th>时间</th><th>文本</th>${state.translation ? '<th>译文</th>' : ''}<th>状态</th><th>操作</th></tr></thead>
               <tbody id="segTbody"></tbody>
             </table>
           </div>
@@ -280,17 +289,19 @@ function renderDetail() {
   $('addBtn').addEventListener('click', () => openEditor('create'));
   $('importSrtBtn').addEventListener('click', openImportModal);
   $('restoreRangeBtn').addEventListener('click', openRestoreModal);
+  $('trackBtn').addEventListener('click', openTrackModal);
   const videoEl = $('videoPlayer');
   videoEl.addEventListener('timeupdate', onTimeUpdate);
 
   renderTimeline();
   renderSegmentTable();
   renderPublishCard();
+  state.renderedWithTrack = !!state.translation;
 }
-
-// 仅刷新依赖片段数据的区域（轮询/写操作后），不重建 <video>
 function renderSegmentDependent() {
   if (state.view !== 'detail') return;
+  // 译文轨道的启用/移除会改变片段表列结构，需整体重渲染
+  if (!!state.translation !== state.renderedWithTrack) { renderDetail(); return; }
   renderTimeline();
   renderSegmentTable();
   renderPublishCard();
@@ -360,27 +371,49 @@ function onTimeUpdate() {
 }
 
 /* ---------- 片段表 ---------- */
+function translationEntry(segmentId) {
+  if (!state.translation) return null;
+  return state.translation.entries.find((e) => e.segment_id === segmentId) || null;
+}
+
+// 译文状态标签：缺失 / 失效 / 待审 / 已审
+function translationTag(entry) {
+  if (!entry) return '<span class="tag miss">缺失</span>';
+  if (entry.stale) return '<span class="tag stale">失效</span>';
+  return entry.reviewed ? '<span class="tag ok">已审</span>' : '<span class="tag warn">待审</span>';
+}
+
 function renderSegmentTable() {
   const tbody = $('segTbody');
   if (!tbody) return;
+  const hasTr = !!state.translation;
   if (!state.segments.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="meta">还没有片段，点击右上角「新增片段」。</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="${hasTr ? 6 : 5}" class="meta">还没有片段，点击右上角「新增片段」。</td></tr>`;
     return;
   }
-  tbody.innerHTML = state.segments.map((s) => `
+  tbody.innerHTML = state.segments.map((s) => {
+    const entry = translationEntry(s.id);
+    const trCell = hasTr
+      ? `<td class="seg-text-cell">${entry ? esc(entry.text) || '<span class="meta">(空)</span>' : '<span class="meta">—</span>'}
+           <div style="margin-top:3px">${translationTag(entry)}${entry ? `<span class="mono"> rev ${entry.revision}</span>` : ''}</div></td>`
+      : '';
+    return `
     <tr data-id="${s.id}" class="${state.activeSegmentId === s.id ? 'active' : ''}">
       <td>${s.id}</td>
       <td class="mono">${fmtTime(s.start_ms)}<br>→ ${fmtTime(s.end_ms)}</td>
       <td class="seg-text-cell">${esc(s.text) || '<span class="meta">(空)</span>'}
           <div class="mono" style="margin-top:3px">rev ${s.revision}</div></td>
+      ${trCell}
       <td>${s.reviewed ? '<span class="tag ok">已审</span>' : '<span class="tag warn">待审</span>'}</td>
       <td><div class="row-actions">
         <button class="btn small" data-act="seek">定位</button>
         <button class="btn small" data-act="edit">编辑</button>
+        ${hasTr ? '<button class="btn small tr" data-act="translate">译文</button>' : ''}
         <button class="btn small ${s.reviewed ? 'ghost' : 'ok'}" data-act="review">${s.reviewed ? '取消审校' : '标记已审'}</button>
         <button class="btn small danger" data-act="del">删除</button>
       </div></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 
   tbody.querySelectorAll('tr').forEach((tr) => {
     const id = Number(tr.dataset.id);
@@ -391,6 +424,8 @@ function renderSegmentTable() {
       renderSegmentDependent();
     });
     tr.querySelector('[data-act=edit]').addEventListener('click', () => openEditor('edit', seg));
+    const trBtn = tr.querySelector('[data-act=translate]');
+    if (trBtn) trBtn.addEventListener('click', () => openTrEditor(seg));
     tr.querySelector('[data-act=review]').addEventListener('click', () => toggleReview(seg));
     tr.querySelector('[data-act=del]').addEventListener('click', () => deleteSegment(seg));
   });
@@ -512,6 +547,7 @@ async function refreshCurrent() {
   const data = await api(`/api/videos/${state.video.id}`);
   state.segments = data.segments;
   state.publications = data.publications;
+  state.translation = data.translation || null;
   renderSegmentDependent();
 }
 
@@ -536,6 +572,158 @@ function showConflict(message, current, editorCtx) {
   };
 }
 
+/* ================= 译文编辑弹窗 ================= */
+function openTrEditor(seg) {
+  if (!state.translation) return;
+  state.trEditor = { segmentId: seg.id };
+  const entry = translationEntry(seg.id);
+  $('trSegId').textContent = seg.id;
+  $('trSegRev').textContent = seg.revision;
+  $('trTime').textContent = `${fmtTime(seg.start_ms)} → ${fmtTime(seg.end_ms)}`;
+  $('trSource').textContent = seg.text || '(空文本)';
+  $('trLang').textContent = state.translation.language;
+  $('trText').value = entry ? entry.text : '';
+  $('trError').textContent = '';
+  $('trStaleNote').classList.toggle('hidden', !(entry && entry.stale));
+  const statusEl = $('trStatus');
+  if (!entry) statusEl.innerHTML = '<span class="tag miss">缺失</span>（尚未录入译文）';
+  else if (entry.stale) statusEl.innerHTML = '<span class="tag stale">失效</span>（原文已变更，需重新校对）';
+  else statusEl.innerHTML = entry.reviewed ? '<span class="tag ok">已审</span>' : '<span class="tag warn">待审</span>';
+  $('trRev').textContent = entry ? `译文 rev ${entry.revision}` : '译文 rev —（保存后创建）';
+  const reviewBtn = $('trReviewBtn');
+  reviewBtn.classList.toggle('hidden', !entry);
+  reviewBtn.textContent = entry && entry.reviewed ? '取消译文审校' : '标记译文已审';
+  reviewBtn.className = `btn ${entry && entry.reviewed ? 'ghost' : 'ok'}${!entry ? ' hidden' : ''}`;
+  $('trModal').classList.remove('hidden');
+}
+
+function closeTrEditor() {
+  state.trEditor = null;
+  $('trModal').classList.add('hidden');
+}
+
+// 保存译文：携带所见原文修订号与（若有）译文修订号；修改文本会撤销译文审校
+async function saveTrEditor() {
+  const ctx = state.trEditor;
+  if (!ctx) return;
+  const seg = state.segments.find((s) => s.id === ctx.segmentId);
+  if (!seg) { closeTrEditor(); return; }
+  const entry = translationEntry(seg.id);
+  const body = { text: $('trText').value, segment_revision: seg.revision };
+  if (entry) body.revision = entry.revision;
+  $('trError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/translation/segments/${seg.id}`, {
+      method: 'PUT', body,
+    });
+    state.segments = state.segments.map((s) => (s.id === data.segment.id ? data.segment : s));
+    state.translation = data.translation;
+    const wasReviewed = entry && entry.reviewed;
+    closeTrEditor();
+    renderSegmentDependent();
+    toast(wasReviewed && !data.entry.reviewed ? '译文已保存；因文本被修改，译文审校已撤销' : '译文已保存', wasReviewed && !data.entry.reviewed);
+  } catch (err) {
+    if (err.status === 409) {
+      closeTrEditor();
+      toast('冲突：原文或译文已被他人修改，已刷新当前状态', true);
+      await refreshCurrent();
+      return;
+    }
+    $('trError').textContent = `未保存：${err.message}`;
+  }
+}
+
+async function toggleTrReview() {
+  const ctx = state.trEditor;
+  if (!ctx) return;
+  const seg = state.segments.find((s) => s.id === ctx.segmentId);
+  const entry = seg && translationEntry(seg.id);
+  if (!seg || !entry) return;
+  const target = !entry.reviewed;
+  $('trError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/translation/segments/${seg.id}/review`, {
+      method: 'POST',
+      body: { reviewed: target, segment_revision: seg.revision, revision: entry.revision },
+    });
+    state.segments = state.segments.map((s) => (s.id === data.segment.id ? data.segment : s));
+    state.translation = data.translation;
+    closeTrEditor();
+    renderSegmentDependent();
+    toast(target ? `片段 #${seg.id} 译文已标记审校` : `片段 #${seg.id} 译文已取消审校`);
+  } catch (err) {
+    if (err.status === 409) {
+      closeTrEditor();
+      toast('冲突：原文或译文已被他人修改，已刷新当前状态', true);
+      await refreshCurrent();
+    } else if (err.status === 422 && err.data && err.data.code === 'translation_stale') {
+      // 失效译文：留在弹窗内提示重新校对
+      $('trStaleNote').classList.remove('hidden');
+      $('trError').textContent = err.message;
+      await refreshCurrent();
+    } else {
+      $('trError').textContent = `操作失败：${err.message}`;
+    }
+  }
+}
+
+/* ================= 译文轨道管理弹窗 ================= */
+function openTrackModal() {
+  $('trackError').textContent = '';
+  const has = !!state.translation;
+  $('trackCurrent').classList.toggle('hidden', !has);
+  $('trackEnable').classList.toggle('hidden', has);
+  $('trackRemoveBtn').classList.toggle('hidden', !has);
+  if (has) {
+    const entries = state.translation.entries;
+    $('trackLang').textContent = state.translation.language;
+    $('trackSegCount').textContent = state.segments.length;
+    $('trackEntryCount').textContent = entries.length;
+    $('trackStaleCount').textContent = entries.filter((e) => e.stale).length;
+    $('trackReviewedCount').textContent = entries.filter((e) => e.reviewed && !e.stale).length;
+  } else {
+    $('trackLangInput').value = '';
+  }
+  $('trackModal').classList.remove('hidden');
+}
+function closeTrackModal() { $('trackModal').classList.add('hidden'); }
+
+async function enableTrack() {
+  const language = $('trackLangInput').value.trim();
+  $('trackError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/translation`, { method: 'POST', body: { language } });
+    state.translation = data.translation;
+    closeTrackModal();
+    renderSegmentDependent();
+    toast(`已启用译文轨道（${data.translation.language}），可逐段录入译文`);
+  } catch (err) {
+    if (err.status === 409) {
+      toast('该视频已启用译文轨道，已刷新', true);
+      closeTrackModal();
+      await refreshCurrent();
+    } else {
+      $('trackError').textContent = err.message;
+    }
+  }
+}
+
+async function removeTrack() {
+  if (!state.translation) return;
+  const lang = state.translation.language;
+  if (!confirm(`确定移除译文轨道（${lang}）？\n全部 ${state.translation.entries.length} 段草稿译文将被清除；已发布版本中的译文快照不受影响。`)) return;
+  $('trackError').textContent = '';
+  try {
+    await api(`/api/videos/${state.video.id}/translation`, { method: 'DELETE' });
+    state.translation = null;
+    closeTrackModal();
+    renderSegmentDependent();
+    toast('译文轨道已移除');
+  } catch (err) {
+    $('trackError').textContent = err.message;
+  }
+}
+
 /* ================= 发布 / 下载 ================= */
 function computeStatus() {
   const problems = [];
@@ -551,10 +739,26 @@ function computeStatus() {
     }
   }
   if (state.segments.some((s) => !s.reviewed)) problems.push('仍有片段未通过审校');
+  // 译文轨道门禁：每段译文须存在、已审且对应当前原文
+  const tr = { missing: 0, stale: 0, unreviewed: 0 };
+  if (state.translation) {
+    for (const s of state.segments) {
+      const e = translationEntry(s.id);
+      if (!e) tr.missing++;
+      else {
+        if (e.stale) tr.stale++;
+        if (!e.reviewed) tr.unreviewed++;
+      }
+    }
+    if (tr.missing) problems.push(`译文（${state.translation.language}）缺失 ${tr.missing} 段`);
+    if (tr.stale) problems.push(`译文（${state.translation.language}）失效 ${tr.stale} 段（原文已变更，需重新校对）`);
+    if (tr.unreviewed) problems.push(`译文（${state.translation.language}）待审 ${tr.unreviewed} 段`);
+  }
   return {
     canPublish: problems.length === 0,
     problems,
     reviewedCount: state.segments.filter((s) => s.reviewed).length,
+    tr,
   };
 }
 
@@ -562,14 +766,19 @@ function renderPublishCard() {
   const card = $('publishCard');
   if (!card) return;
   const status = computeStatus();
+  const trRow = state.translation
+    ? `<li class="${status.tr.missing + status.tr.stale + status.tr.unreviewed === 0 && state.segments.length ? 'good' : 'bad'}">
+        译文（${esc(state.translation.language)}）：缺失 ${status.tr.missing} ｜ 失效 ${status.tr.stale} ｜ 待审 ${status.tr.unreviewed}</li>`
+    : '';
   card.innerHTML = `
     <h2>发布与下载</h2>
-    <p class="meta">发布生成不可变版本快照；发布后再编辑只影响草稿，不影响历史版本。</p>
+    <p class="meta">发布生成不可变版本快照${state.translation ? '（固定原文与译文两轨内容）' : ''}；发布后再编辑只影响草稿，不影响历史版本。</p>
     <ul class="status-list">
       <li class="${state.segments.length ? 'good' : 'bad'}">片段数量：${state.segments.length}（至少 1 段）</li>
       <li class="${status.reviewedCount === state.segments.length && state.segments.length ? 'good' : 'bad'}">
         审校进度：${status.reviewedCount}/${state.segments.length}</li>
-      ${status.problems.filter((p) => !p.includes('未通过审校') && !p.includes('至少需要')).map((p) =>
+      ${trRow}
+      ${status.problems.filter((p) => !p.includes('未通过审校') && !p.includes('至少需要') && !p.startsWith('译文')).map((p) =>
         `<li class="bad">时间问题：${esc(p)}</li>`).join('')}
     </ul>
     <div class="publish-bar">
@@ -583,13 +792,19 @@ function renderPublishCard() {
 
   $('publishBtn').addEventListener('click', publishVersion);
 
-  const menu = $('downloadMenu');  const items = ['<div class="label">草稿（当前编辑内容）</div>',
-    `<a href="/api/videos/${state.video.id}/srt?version=draft">草稿 SRT</a>`];
+  const menu = $('downloadMenu');  const items = ['<div class="label">原文 · 草稿（当前编辑内容）</div>',
+    `<a href="/api/videos/${state.video.id}/srt?version=draft">原文 SRT（草稿）</a>`];
+  if (state.translation) {
+    items.push(`<a href="/api/videos/${state.video.id}/srt/translation?version=draft">译文 SRT（草稿 · ${esc(state.translation.language)}）</a>`);
+  }
   if (state.publications.length) {
     items.push('<div class="label" style="margin-top:6px">已发布版本（不可变）</div>');
-    items.push(`<a href="/api/videos/${state.video.id}/srt?version=published">最新已发布 v${state.publications[0].version} SRT</a>`);
+    items.push(`<a href="/api/videos/${state.video.id}/srt?version=published">原文 SRT · 最新已发布 v${state.publications[0].version}</a>`);
     for (const p of state.publications) {
-      items.push(`<a href="/api/videos/${state.video.id}/srt?version=${p.version}">v${p.version}（${new Date(p.published_at).toLocaleString()}，${p.segment_count} 段）</a>`);
+      items.push(`<a href="/api/videos/${state.video.id}/srt?version=${p.version}">原文 v${p.version}（${new Date(p.published_at).toLocaleString()}，${p.segment_count} 段）</a>`);
+      if (p.translation_language) {
+        items.push(`<a href="/api/videos/${state.video.id}/srt/translation?version=${p.version}">译文 v${p.version}（${esc(p.translation_language)}）</a>`);
+      }
     }
   } else {
     items.push('<div class="label" style="margin-top:6px;color:var(--warn)">尚无已发布版本</div>');
@@ -603,7 +818,7 @@ function renderPublishCard() {
   const pubList = $('pubList');
   pubList.innerHTML = state.publications.length
     ? '历史发布：' + state.publications
-        .map((p) => `v${p.version} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段`)
+        .map((p) => `v${p.version}${p.translation_language ? `（含译文 ${esc(p.translation_language)}）` : ''} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段`)
         .join(' ｜ ')
     : '尚未发布过版本';
 }
@@ -933,6 +1148,14 @@ $('restoreModal').addEventListener('click', (e) => { if (e.target === $('restore
   $(id).addEventListener('input', invalidateRestorePreview);
   $(id).addEventListener('change', invalidateRestorePreview);
 });
+$('trCancel').addEventListener('click', closeTrEditor);
+$('trSave').addEventListener('click', saveTrEditor);
+$('trReviewBtn').addEventListener('click', toggleTrReview);
+$('trModal').addEventListener('click', (e) => { if (e.target === $('trModal')) closeTrEditor(); });
+$('trackCancel').addEventListener('click', closeTrackModal);
+$('trackEnableBtn').addEventListener('click', enableTrack);
+$('trackRemoveBtn').addEventListener('click', removeTrack);
+$('trackModal').addEventListener('click', (e) => { if (e.target === $('trackModal')) closeTrackModal(); });
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {

@@ -32,6 +32,14 @@
   - 确认后区间内草稿片段被移除，历史片段作为**待审新片段**写入（修订号从 1 开始）；区间外草稿片段及其修订号、历史发布版本与 SRT 导出语义均不变；
   - 确认的版本与区间须与预览一致；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览；
   - 版本不存在、区间越界或替换后时间线不合法时不写入任何内容；整批恢复在一个事务内原子完成。
+- **译文轨道（每视频一个指定语言）**：
+  - 每个视频可启用**一个**译文轨道（语言代码如 `en`、`zh-CN`），译文逐段关联当前草稿原文片段；
+  - 录入或审校译文须同时携带**所见原文修订号** `segment_revision` 与**所见译文修订号** `revision`，过期返回 `409` 与当前两轨状态；修改译文文本自动撤销其审校；
+  - **失效语义**：原文文字或时间改变 → 对应译文立即标记失效；仅切换原文审校状态不失效；删除片段、SRT 整稿替换、区间恢复产生的新片段一律不沿用旧译文；
+  - 工作台片段表并列展示两轨的待审/失效状态，失效译文可重新校对后再审校；
+  - **发布门禁升级**：启用轨道的视频，须每段原文、译文均已审且译文对应当前原文内容才能发布；失败返回结构化待处理片段清单（`pending`），不生成部分版本；
+  - 发布快照**固定两轨内容**；原有单语 SRT 导出与旧发布版本（无译文快照）语义不变；
+  - 可导出**草稿**或**含译文的发布版本**的译文 SRT；草稿译文缺失或失效时拒绝并逐段指出片段。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -72,7 +80,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入与历史版本区间恢复等 166 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复，以及译文轨道的双修订号、失效语义、发布门禁与译文 SRT 导出等 261 个断言）：
 
 ```bash
 npm test
@@ -108,8 +116,11 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 5. 需要把某段字幕回退到历史版本时，点「↩ 区间恢复…」：选择已发布版本并填写整数毫秒区间，
    「预览恢复」后并列核对区间内发布快照与当前草稿、以及将移除/恢复的清单，再「确认恢复」；
    恢复片段为待审，需重新审校后才能再次发布。
-6. 右侧「发布与下载」面板实时列出阻塞发布的问题；全部满足后点「发布新版本」。
-7. 用「下载 SRT ▾」选择草稿或任一已发布版本导出。
+6. 需要译文时，点「🌐 译文轨道…」启用指定语言的轨道；片段表随即多出译文列，
+   逐条点「译文」录入并「标记译文已审」。原文文字/时间变更会使对应译文标红「失效」，
+   重新打开译文弹窗校对保存即可恢复有效，再审校后方能发布。
+7. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/失效/待审统计）；全部满足后点「发布新版本」。
+8. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出。
 
 ## HTTP API 摘要
 
@@ -118,21 +129,27 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/videos` | multipart 上传：`title`、`duration_ms`、`video` |
-| `GET` | `/api/videos` / `/api/videos/:id` | 列表 / 详情（含片段与发布版本） |
+| `GET` | `/api/videos` / `/api/videos/:id` | 列表 / 详情（含片段、发布版本与译文轨道视图） |
 | `DELETE` | `/api/videos/:id` | 删除视频及其全部数据 |
 | `GET` | `/api/videos/:id/media` | 视频流（支持 `Range`） |
 | `POST` | `/api/videos/:id/segments` | 新增片段 `{start_ms,end_ms,text}` |
 | `PUT` | `/api/videos/:id/segments/:sid` | 修改 `{start_ms,end_ms,text,revision}` |
 | `DELETE` | `/api/videos/:id/segments/:sid` | 删除（JSON 体带 `revision`） |
 | `POST` | `/api/videos/:id/segments/:sid/review` | 审校切换 `{reviewed,revision}` |
-| `GET` | `/api/videos/:id/status` | 发布门禁检查 |
-| `POST` | `/api/videos/:id/publish` | 发布不可变版本 |
-| `GET` | `/api/videos/:id/publications` | 已发布版本列表 |
+| `GET` | `/api/videos/:id/status` | 发布门禁检查（含译文轨道统计与待处理清单） |
+| `POST` | `/api/videos/:id/publish` | 发布不可变版本（启用轨道时快照固定两轨） |
+| `GET` | `/api/videos/:id/publications` | 已发布版本列表（含 `translation_language`） |
 | `POST` | `/api/videos/:id/srt/preview` | 预览 SRT 导入（multipart 字段 `srt`，或 JSON `{content}`），返回条目/行号/草稿冲突与确认令牌 `token` |
 | `POST` | `/api/videos/:id/srt/import` | 确认写入：multipart 或 JSON 携带 `srt`/`content`、`mode=append\|replace`、预览返回的 `token` |
 | `POST` | `/api/videos/:id/restore/preview` | 预览区间恢复 `{version,start_ms,end_ms}`，返回两侧片段清单（`to_restore`/`to_remove`）与确认令牌 `token` |
 | `POST` | `/api/videos/:id/restore/confirm` | 确认区间恢复 `{version,start_ms,end_ms,token}`，事务内整批替换 |
-| `GET` | `/api/videos/:id/srt?version=` | 导出 SRT：`draft`（默认）/ `published` / `1` 等版本号 |
+| `GET` | `/api/videos/:id/srt?version=` | 导出原文 SRT：`draft`（默认）/ `published` / `1` 等版本号 |
+| `POST` | `/api/videos/:id/translation` | 启用译文轨道 `{language}`（每视频一个；已存在返回 `409`） |
+| `DELETE` | `/api/videos/:id/translation` | 移除译文轨道及全部草稿译文（已发布快照不受影响） |
+| `GET` | `/api/videos/:id/translation` | 轨道视图：语言 + 每段译文（含 `reviewed`/`stale`/`revision`） |
+| `PUT` | `/api/videos/:id/translation/segments/:sid` | 录入/修改译文 `{text,segment_revision,revision?}`（新建不带 `revision`） |
+| `POST` | `/api/videos/:id/translation/segments/:sid/review` | 审校译文 `{reviewed,segment_revision,revision}`（失效译文须先重新校对） |
+| `GET` | `/api/videos/:id/srt/translation?version=` | 导出译文 SRT：`draft` / `published` / 版本号；缺失或失效拒绝并指出片段 |
 
 错误响应统一为 `{ "error": { "code", "message", "current?" } }`：
 `422` 为非法修改（含原因），`409` 为修订冲突（`current` 为最新片段）。
@@ -272,11 +289,95 @@ curl -s -X POST http://localhost:8080/api/videos/12/restore/confirm \
 | `409 preview_required` | 缺失/伪造/过期（服务重启）的恢复预览令牌，需先预览 |
 | `409 draft_changed` | 预览后草稿被修改（增删改或审校变化）；响应附 `current_segments`，必须重新预览后再确认 |
 
+### 译文轨道调用示例
+
+每个视频可启用**一个**指定语言的译文轨道。译文写操作须携带**双修订号**：
+`segment_revision`（所见原文片段修订号）+ `revision`（所见译文修订号，新建译文时不带）。
+过期返回 `409 revision_conflict`，`error.current` 同时给出当前原文与当前译文，绝不覆盖他人修改。
+
+```bash
+# 1) 启用译文轨道（语言代码如 en / zh-CN；重复启用返回 409 translation_exists）
+curl -s -X POST http://localhost:8080/api/videos/12/translation \
+  -H 'Content-Type: application/json' -d '{"language":"en"}'
+
+# 2) 为片段 #7 录入译文（该片段当前修订号为 3；新建不带 revision）
+curl -s -X PUT http://localhost:8080/api/videos/12/translation/segments/7 \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello world","segment_revision":3}'
+
+# 3) 修改译文（须同时携带原文修订号 3 与译文修订号 1；文本变化会撤销译文审校）
+curl -s -X PUT http://localhost:8080/api/videos/12/translation/segments/7 \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello, world!","segment_revision":3,"revision":1}'
+
+# 4) 审校译文（同样双修订号；译文失效时返回 422 translation_stale，须先重新校对保存）
+curl -s -X POST http://localhost:8080/api/videos/12/translation/segments/7/review \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewed":true,"segment_revision":3,"revision":2}'
+
+# 5) 查看轨道：每段译文的 reviewed / stale / revision
+curl -s http://localhost:8080/api/videos/12/translation
+```
+
+**失效语义**：修改原文文字或时间后，对应译文 `stale: true`（审校标记保留但发布/导出均不认）；
+仅切换原文审校状态不失效；删除片段、SRT 整稿替换、区间恢复产生的新片段一律没有译文。
+重新校对即再次 `PUT` 译文（携带当前原文修订号），保存后 `stale` 消除，可重新审校。
+
+**发布门禁**：启用轨道后，`POST /api/videos/:id/publish` 要求每段原文已审、每段译文存在、
+已审且未失效；不满足时返回 `422 not_publishable` 与结构化待处理清单，不生成部分版本：
+
+```json
+{
+  "error": {
+    "code": "not_publishable",
+    "message": "当前草稿不能发布：译文轨道（en）：1 个片段缺少译文；1 个片段的译文已失效（原文已变更，需重新校对）",
+    "pending": [
+      { "segment_id": 8, "start_ms": 3000, "end_ms": 4000, "issues": ["translation_missing"] },
+      { "segment_id": 7, "start_ms": 1000, "end_ms": 2000, "issues": ["translation_stale", "source_not_reviewed"] }
+    ],
+    "translation": { "enabled": true, "language": "en", "missing": 1, "unreviewed": 0, "stale": 1, "ready": false }
+  }
+}
+```
+
+`issues` 取值：`source_not_reviewed`（原文待审）、`translation_missing`（译文缺失）、
+`translation_not_reviewed`（译文待审）、`translation_stale`（译文失效）。
+发布成功后快照固定两轨内容，版本对象带 `translation_language`。
+
+**译文 SRT 导出**：
+
+```bash
+# 草稿译文（每段都须有译文且未失效，否则 422 translation_incomplete 并逐段指出）
+curl -sOJ "http://localhost:8080/api/videos/12/srt/translation?version=draft"
+
+# 含译文的发布版本（旧版本无译文快照时返回 404 translation_not_found）
+curl -sOJ "http://localhost:8080/api/videos/12/srt/translation?version=published"
+curl -sOJ "http://localhost:8080/api/videos/12/srt/translation?version=2"
+```
+
+草稿导出失败示例（`error.segments[]` 逐段指出 `translation_missing` / `translation_stale`）：
+
+```json
+{
+  "error": {
+    "code": "translation_incomplete",
+    "message": "草稿译文不完整，无法导出（1 个片段待处理）：\n片段 #7（1000–2000ms）缺少译文",
+    "segments": [
+      { "segment_id": 7, "start_ms": 1000, "end_ms": 2000, "issue": "translation_missing",
+        "message": "片段 #7（1000–2000ms）缺少译文" }
+    ]
+  }
+}
+```
+
+**移除轨道**：`DELETE /api/videos/:id/translation` 清除轨道与全部草稿译文（`204`）；
+已发布版本中的译文快照不受影响，之后可重新启用其它语言。
+
 ## 数据布局
 
 ```
 data/
-├── app.db            # SQLite：videos / segments / publications
+├── app.db            # SQLite：videos / segments / publications / translation_tracks / translations
 └── videos/           # 上传的原始视频文件（随机化文件名）
 ```
 

@@ -82,13 +82,82 @@ function parseRevision(body) {
 }
 
 function mapPublication(row) {
+  let translationLanguage = null;
+  if (row.translation_snapshot) {
+    try { translationLanguage = JSON.parse(row.translation_snapshot).language || null; } catch (_) { /* 忽略损坏快照 */ }
+  }
   return {
     id: row.id,
     video_id: row.video_id,
     version: row.version,
     segment_count: row.segment_count,
     published_at: row.published_at,
+    translation_language: translationLanguage,
   };
+}
+
+/* ---------------- 译文轨道 ---------------- */
+
+function loadTrack(videoId) {
+  return get().prepare('SELECT * FROM translation_tracks WHERE video_id = ?').get(videoId) || null;
+}
+
+function requireTrack(videoId) {
+  const track = loadTrack(videoId);
+  if (!track) throw new ApiError(404, 'translation_not_enabled', `视频 #${videoId} 尚未启用译文轨道`);
+  return track;
+}
+
+// 译文是否对应当前原文内容：原文文字或时间改变即失效（仅切换原文审校不影响）
+function isStale(trRow, segRow) {
+  return (
+    trRow.source_text !== segRow.text ||
+    trRow.source_start_ms !== segRow.start_ms ||
+    trRow.source_end_ms !== segRow.end_ms
+  );
+}
+
+function mapTranslation(row, segRow) {
+  return {
+    segment_id: row.segment_id,
+    text: row.text,
+    reviewed: row.reviewed === 1,
+    revision: row.revision,
+    stale: segRow ? isStale(row, segRow) : false,
+    updated_at: row.updated_at,
+  };
+}
+
+// 轨道视图：{language, entries:[...]}；entries 仅含当前仍存在的草稿片段的译文
+function translationView(videoId) {
+  const track = loadTrack(videoId);
+  if (!track) return null;
+  const rows = get()
+    .prepare(
+      `SELECT t.*, s.text AS seg_text, s.start_ms AS seg_start, s.end_ms AS seg_end
+       FROM translations t
+       JOIN segments s ON s.id = t.segment_id
+       WHERE t.track_id = ?
+       ORDER BY s.start_ms, s.id`
+    )
+    .all(track.id);
+  return {
+    language: track.language,
+    entries: rows.map((r) =>
+      mapTranslation(r, { text: r.seg_text, start_ms: r.seg_start, end_ms: r.seg_end })
+    ),
+  };
+}
+
+function normalizeLanguage(value) {
+  if (typeof value !== 'string') {
+    throw new ApiError(422, 'invalid_language', '请提交语言代码 language（字符串，如 en、zh-CN）');
+  }
+  const lang = value.trim();
+  if (!/^[A-Za-z0-9]{1,8}(-[A-Za-z0-9]{1,8})*$/.test(lang)) {
+    throw new ApiError(422, 'invalid_language', `语言代码不合法："${value}"（应为 BCP47 风格，如 en、zh-CN、pt-BR）`);
+  }
+  return lang;
 }
 
 /* ---------------- 视频 ---------------- */
@@ -99,7 +168,8 @@ router.get('/videos', (req, res) => {
       `SELECT v.*,
               (SELECT COUNT(*) FROM segments s WHERE s.video_id = v.id) AS segment_count,
               (SELECT COUNT(*) FROM segments s WHERE s.video_id = v.id AND s.reviewed = 1) AS reviewed_count,
-              (SELECT MAX(p.version) FROM publications p WHERE p.video_id = v.id) AS latest_version
+              (SELECT MAX(p.version) FROM publications p WHERE p.video_id = v.id) AS latest_version,
+              (SELECT t.language FROM translation_tracks t WHERE t.video_id = v.id) AS translation_language
        FROM videos v ORDER BY v.created_at DESC`
     )
     .all();
@@ -143,6 +213,7 @@ router.get('/videos/:id(\\d+)', (req, res, next) => {
         .prepare('SELECT * FROM publications WHERE video_id = ? ORDER BY version DESC')
         .all(video.id)
         .map(mapPublication),
+      translation: translationView(video.id),
     });
   } catch (err) {
     next(err);
@@ -153,6 +224,7 @@ router.delete('/videos/:id(\\d+)', (req, res, next) => {
   try {
     const video = loadVideo(req.params.id);
     const tx = get().transaction(() => {
+      // translations / translation_tracks 经外键级联随 segments / videos 删除
       get().prepare('DELETE FROM segments WHERE video_id = ?').run(video.id);
       get().prepare('DELETE FROM publications WHERE video_id = ?').run(video.id);
       get().prepare('DELETE FROM videos WHERE id = ?').run(video.id);
@@ -372,13 +444,64 @@ router.delete('/videos/:id(\\d+)/segments/:sid(\\d+)', (req, res, next) => {
 
 /* ---------------- 发布与导出 ---------------- */
 
+// 发布门禁：原文全部已审 + 时间合法；启用译文轨道时还要求每段译文存在、已审且对应当前原文。
+// pending 为结构化待处理片段清单（发布失败时随 422 返回，不生成部分版本）。
 function publicationStatus(videoId, segments) {
   const problems = [];
+  const pending = [];
   if (segments.length === 0) problems.push('至少需要一个字幕片段才能发布');
   if (segments.some((s) => !s.reviewed)) problems.push('仍有片段未通过审校');
   const check = validateTimeline(segments, segmentsVideoDuration(videoId));
   if (!check.ok) problems.push(check.reason);
-  return { canPublish: problems.length === 0, problems };
+
+  const track = loadTrack(videoId);
+  let translation = null;
+  if (track) {
+    const trRows = get()
+      .prepare('SELECT * FROM translations WHERE track_id = ?')
+      .all(track.id);
+    const bySegment = new Map(trRows.map((r) => [r.segment_id, r]));
+    let missing = 0;
+    let unreviewed = 0;
+    let stale = 0;
+    for (const s of segments) {
+      const issues = [];
+      if (!s.reviewed) issues.push('source_not_reviewed');
+      const tr = bySegment.get(s.id);
+      if (!tr) {
+        issues.push('translation_missing');
+        missing++;
+      } else {
+        if (isStale(tr, s)) {
+          issues.push('translation_stale');
+          stale++;
+        }
+        if (!tr.reviewed) {
+          issues.push('translation_not_reviewed');
+          unreviewed++;
+        }
+      }
+      if (issues.length) {
+        pending.push({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, issues });
+      }
+    }
+    if (missing) problems.push(`译文轨道（${track.language}）：${missing} 个片段缺少译文`);
+    if (stale) problems.push(`译文轨道（${track.language}）：${stale} 个片段的译文已失效（原文已变更，需重新校对）`);
+    if (unreviewed) problems.push(`译文轨道（${track.language}）：${unreviewed} 个片段的译文未通过审校`);
+    translation = {
+      enabled: true,
+      language: track.language,
+      missing,
+      unreviewed,
+      stale,
+      ready: missing === 0 && unreviewed === 0 && stale === 0,
+    };
+  } else {
+    for (const s of segments) {
+      if (!s.reviewed) pending.push({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, issues: ['source_not_reviewed'] });
+    }
+  }
+  return { canPublish: problems.length === 0, problems, pending, translation };
 }
 
 function segmentsVideoDuration(videoId) {
@@ -404,7 +527,11 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
       const segments = listSegments(video.id);
       const status = publicationStatus(video.id, segments);
       if (!status.canPublish) {
-        throw new ApiError(422, 'not_publishable', `当前草稿不能发布：${status.problems.join('；')}`);
+        // 不生成部分版本：附结构化待处理片段清单
+        throw new ApiError(422, 'not_publishable', `当前草稿不能发布：${status.problems.join('；')}`, {
+          pending: status.pending,
+          translation: status.translation,
+        });
       }
       const maxRow = get()
         .prepare('SELECT COALESCE(MAX(version), 0) AS v FROM publications WHERE video_id = ?')
@@ -413,12 +540,32 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
       const snapshot = JSON.stringify(
         segments.map((s) => ({ start_ms: s.start_ms, end_ms: s.end_ms, text: s.text }))
       );
+      // 启用译文轨道时快照固定两轨内容（此时每段译文均已审且对应当前原文）
+      let translationSnapshot = null;
+      if (status.translation && status.translation.enabled) {
+        const trRows = get()
+          .prepare(
+            `SELECT t.* FROM translations t
+             JOIN translation_tracks tt ON tt.id = t.track_id
+             WHERE tt.video_id = ?`
+          )
+          .all(video.id);
+        const bySegment = new Map(trRows.map((r) => [r.segment_id, r]));
+        translationSnapshot = JSON.stringify({
+          language: status.translation.language,
+          entries: segments.map((s) => ({
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+            text: bySegment.get(s.id).text,
+          })),
+        });
+      }
       const info = get()
         .prepare(
-          `INSERT INTO publications (video_id, version, snapshot, segment_count, published_at)
-           VALUES (?, ?, ?, ?, ?)`
+          `INSERT INTO publications (video_id, version, snapshot, translation_snapshot, segment_count, published_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
         )
-        .run(video.id, version, snapshot, segments.length, now());
+        .run(video.id, version, snapshot, translationSnapshot, segments.length, now());
       return get().prepare('SELECT * FROM publications WHERE id = ?').get(info.lastInsertRowid);
     })();
     res.status(201).json({ publication: mapPublication(pub) });
@@ -470,6 +617,272 @@ router.get('/videos/:id(\\d+)/srt', (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(video.title)}-${label}.srt`);
     res.setHeader('X-Subtitle-Desc', encodeURIComponent(displayName));
     res.send(buildSrt(segments));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- 译文轨道：启用 / 移除 / 查看 ---------------- */
+
+// 启用译文轨道（每个视频至多一个，绑定一种语言）
+router.post('/videos/:id(\\d+)/translation', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const language = normalizeLanguage(req.body && req.body.language);
+    const existing = loadTrack(video.id);
+    if (existing) {
+      throw new ApiError(409, 'translation_exists',
+        `该视频已启用译文轨道（${existing.language}）；如需更换语言请先移除现有轨道`, {
+          current: { language: existing.language },
+        });
+    }
+    get()
+      .prepare('INSERT INTO translation_tracks (video_id, language, created_at) VALUES (?, ?, ?)')
+      .run(video.id, language, now());
+    res.status(201).json({ translation: translationView(video.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 移除译文轨道及其全部译文（已发布版本中的译文快照不受影响）
+router.delete('/videos/:id(\\d+)/translation', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    requireTrack(video.id);
+    get().prepare('DELETE FROM translation_tracks WHERE video_id = ?').run(video.id);
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/videos/:id(\\d+)/translation', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    requireTrack(video.id);
+    res.json({ translation: translationView(video.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- 译文：录入 / 修改 / 审校 ---------------- */
+
+// 事务内校验双修订号（所见原文 segment_revision + 所见译文 revision），过期拒绝并返回当前两轨状态
+function loadSegmentForTranslation(videoId, segmentId, expectedSegRevision) {
+  const seg = get()
+    .prepare('SELECT * FROM segments WHERE id = ? AND video_id = ?')
+    .get(segmentId, videoId);
+  if (!seg) throw new ApiError(404, 'segment_not_found', `片段 #${segmentId} 不存在`);
+  if (seg.revision !== expectedSegRevision) {
+    throw revisionConflict(videoId, seg);
+  }
+  return seg;
+}
+
+function currentTranslationState(videoId, track, segmentId) {
+  const seg = get()
+    .prepare('SELECT * FROM segments WHERE id = ? AND video_id = ?')
+    .get(segmentId, videoId);
+  const tr = track
+    ? get().prepare('SELECT * FROM translations WHERE track_id = ? AND segment_id = ?').get(track.id, segmentId)
+    : null;
+  return {
+    segment: seg ? mapSegment(seg) : null,
+    translation: tr && seg ? mapTranslation(tr, seg) : null,
+  };
+}
+
+function revisionConflict(videoId, seg) {
+  return new ApiError(409, 'revision_conflict',
+    '修订号已过期：原文或译文已被他人修改，已为你加载当前状态，请基于当前内容重试', {
+      current: currentTranslationState(videoId, loadTrack(videoId), seg.id),
+    });
+}
+
+function parseSegmentRevision(body) {
+  const rev = Number(body && body.segment_revision);
+  if (!Number.isInteger(rev) || rev < 1) {
+    throw new ApiError(422, 'missing_revision', '请携带所见原文修订号 segment_revision（正整数）');
+  }
+  return rev;
+}
+
+// 录入新译文或修改已有译文；修改文本会撤销译文审校状态
+router.put('/videos/:id(\\d+)/translation/segments/:sid(\\d+)', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const track = requireTrack(video.id);
+    const segRevision = parseSegmentRevision(req.body);
+    const text = normalizeText(req.body && req.body.text != null ? req.body.text : '');
+    const hasTrRevision = req.body && req.body.revision != null;
+    const trRevision = hasTrRevision ? Number(req.body.revision) : null;
+    if (hasTrRevision && (!Number.isInteger(trRevision) || trRevision < 1)) {
+      throw new ApiError(422, 'missing_revision', '译文修订号 revision 必须为正整数');
+    }
+
+    const result = get().transaction(() => {
+      const seg = loadSegmentForTranslation(video.id, Number(req.params.sid), segRevision);
+      const tr = get()
+        .prepare('SELECT * FROM translations WHERE track_id = ? AND segment_id = ?')
+        .get(track.id, seg.id);
+
+      if (tr) {
+        if (!hasTrRevision || tr.revision !== trRevision) {
+          throw revisionConflict(video.id, seg);
+        }
+        // 文本被修改 -> 撤销译文审校；译文重新对应当前原文（source_* 记录所见原文）
+        const nextReviewed = tr.text !== text ? 0 : tr.reviewed;
+        get()
+          .prepare(
+            `UPDATE translations
+             SET text = ?, reviewed = ?, revision = revision + 1,
+                 source_text = ?, source_start_ms = ?, source_end_ms = ?, updated_at = ?
+             WHERE id = ?`
+          )
+          .run(text, nextReviewed, seg.text, seg.start_ms, seg.end_ms, now(), tr.id);
+      } else {
+        if (hasTrRevision) {
+          // 客户端基于「已有译文」的状态提交，但实际译文不存在（可能已被移除轨道后重建）
+          throw revisionConflict(video.id, seg);
+        }
+        get()
+          .prepare(
+            `INSERT INTO translations (track_id, segment_id, text, reviewed, revision, source_text, source_start_ms, source_end_ms, updated_at)
+             VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?)`
+          )
+          .run(track.id, seg.id, text, seg.text, seg.start_ms, seg.end_ms, now());
+      }
+      return currentTranslationState(video.id, track, seg.id);
+    })();
+
+    res.json({ segment: result.segment, entry: result.translation, translation: translationView(video.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 审校 / 取消审校译文；失效译文须先重新校对（更新）才能审校
+router.post('/videos/:id(\\d+)/translation/segments/:sid(\\d+)/review', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const track = requireTrack(video.id);
+    const segRevision = parseSegmentRevision(req.body);
+    const trRevision = parseRevision(req.body);
+    const reviewed = req.body.reviewed === true || req.body.reviewed === false ? req.body.reviewed : null;
+    if (reviewed == null) throw new ApiError(422, 'invalid_reviewed', '请提交 reviewed: true/false');
+
+    const result = get().transaction(() => {
+      const seg = loadSegmentForTranslation(video.id, Number(req.params.sid), segRevision);
+      const tr = get()
+        .prepare('SELECT * FROM translations WHERE track_id = ? AND segment_id = ?')
+        .get(track.id, seg.id);
+      if (!tr) {
+        throw new ApiError(404, 'translation_not_found', `片段 #${seg.id} 还没有译文，请先录入译文`, {
+          current: currentTranslationState(video.id, track, seg.id),
+        });
+      }
+      if (tr.revision !== trRevision) throw revisionConflict(video.id, seg);
+      if (reviewed && isStale(tr, seg)) {
+        throw new ApiError(422, 'translation_stale',
+          '译文已失效（原文文字或时间已变更），请先重新校对并保存译文，再标记审校', {
+            current: currentTranslationState(video.id, track, seg.id),
+          });
+      }
+      get()
+        .prepare('UPDATE translations SET reviewed = ?, revision = revision + 1, updated_at = ? WHERE id = ?')
+        .run(reviewed ? 1 : 0, now(), tr.id);
+      return currentTranslationState(video.id, track, seg.id);
+    })();
+
+    res.json({ segment: result.segment, entry: result.translation, translation: translationView(video.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- 译文 SRT 导出 ---------------- */
+
+// 草稿译文导出：每段都须有译文且对应当前原文；缺失或失效时拒绝并逐段指出
+function draftTranslationEntries(video, track) {
+  const segments = listSegments(video.id);
+  const trRows = get().prepare('SELECT * FROM translations WHERE track_id = ?').all(track.id);
+  const bySegment = new Map(trRows.map((r) => [r.segment_id, r]));
+  const problems = [];
+  const entries = [];
+  for (const s of segments) {
+    const tr = bySegment.get(s.id);
+    if (!tr) {
+      problems.push({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, issue: 'translation_missing',
+        message: `片段 #${s.id}（${s.start_ms}–${s.end_ms}ms）缺少译文` });
+      continue;
+    }
+    if (isStale(tr, s)) {
+      problems.push({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, issue: 'translation_stale',
+        message: `片段 #${s.id}（${s.start_ms}–${s.end_ms}ms）的译文已失效：原文文字或时间已变更，需重新校对` });
+      continue;
+    }
+    entries.push({ start_ms: s.start_ms, end_ms: s.end_ms, text: tr.text });
+  }
+  if (problems.length) {
+    throw new ApiError(422, 'translation_incomplete',
+      `草稿译文不完整，无法导出（${problems.length} 个片段待处理）：\n${problems[0].message}`,
+      { segments: problems });
+  }
+  return entries;
+}
+
+router.get('/videos/:id(\\d+)/srt/translation', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const versionParam = req.query.version;
+    let entries;
+    let language;
+    let label;
+    let displayName;
+
+    if (!versionParam || versionParam === 'draft') {
+      const track = requireTrack(video.id);
+      language = track.language;
+      entries = draftTranslationEntries(video, track);
+      label = 'draft';
+      displayName = '草稿译文';
+    } else {
+      let row;
+      let versionLabel;
+      if (versionParam === 'published') {
+        row = get()
+          .prepare('SELECT * FROM publications WHERE video_id = ? ORDER BY version DESC LIMIT 1')
+          .get(video.id);
+        if (!row) throw new ApiError(404, 'no_publication', '该视频尚无已发布版本');
+        versionLabel = row.version;
+      } else {
+        const version = Number(versionParam);
+        if (!Number.isInteger(version) || version < 1) {
+          throw new ApiError(422, 'invalid_version', 'version 取值：draft、published 或正整数版本号');
+        }
+        row = get()
+          .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+          .get(video.id, version);
+        if (!row) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+        versionLabel = version;
+      }
+      if (!row.translation_snapshot) {
+        throw new ApiError(404, 'translation_not_found', `已发布版本 v${versionLabel} 不含译文快照（发布时未启用译文轨道）`);
+      }
+      const snap = JSON.parse(row.translation_snapshot);
+      language = snap.language;
+      entries = snap.entries;
+      label = `v${versionLabel}`;
+      displayName = `已发布 v${versionLabel} 译文`;
+    }
+
+    res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
+    res.setHeader('Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(video.title)}-${label}-${encodeURIComponent(language)}.srt`);
+    res.setHeader('X-Subtitle-Desc', encodeURIComponent(`${displayName}（${language}）`));
+    res.send(buildSrt(entries));
   } catch (err) {
     next(err);
   }

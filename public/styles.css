@@ -153,6 +153,10 @@ video { width: 100%; background: #000; border-radius: 8px; max-height: 420px; }
 .tag.ok { background: rgba(52,199,138,.15); color: var(--ok); }
 .tag.warn { background: rgba(240,169,59,.15); color: var(--warn); }
 .tag.rev { background: rgba(147,160,184,.18); color: var(--muted); }
+.tag.miss { background: rgba(147,160,184,.18); color: var(--muted); }
+.tag.stale { background: rgba(239,95,111,.15); color: var(--danger); }
+.badge.tr { background: rgba(79,140,255,.15); color: var(--primary); }
+.btn.tr { border-color: var(--primary); color: var(--primary); }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
 .side-scroll { max-height: 560px; overflow-y: auto; }

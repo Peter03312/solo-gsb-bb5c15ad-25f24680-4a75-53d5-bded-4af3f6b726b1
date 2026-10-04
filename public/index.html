@@ -150,6 +150,58 @@
     </div>
   </div>
 
+  <!-- 译文编辑弹窗 -->
+  <div id="trModal" class="modal hidden">
+    <div class="modal-card">
+      <h3 id="trTitle">片段译文</h3>
+      <p class="meta">片段 #<span id="trSegId"></span> ｜ 原文修订号 <b id="trSegRev"></b>
+        <span id="trStaleNote" class="warn hidden">（原文已变更，译文失效：请重新校对后保存）</span></p>
+      <div class="conflict-current">
+        <p class="meta" style="margin:0">当前原文（<span id="trTime"></span>）</p>
+        <pre id="trSource"></pre>
+      </div>
+      <p class="meta" style="margin-top:10px">译文状态：<span id="trStatus"></span>
+        <span class="mono" id="trRev"></span></p>
+      <label class="block">译文文本（<span id="trLang"></span>）
+        <textarea id="trText" rows="4"></textarea>
+      </label>
+      <p id="trError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="trCancel">取消</button>
+        <button type="button" class="btn ok hidden" id="trReviewBtn">标记译文已审</button>
+        <button type="button" class="btn primary" id="trSave">保存译文</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 译文轨道管理弹窗 -->
+  <div id="trackModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>译文轨道</h3>
+      <div id="trackCurrent" class="hidden">
+        <p class="meta">当前已启用译文轨道，语言代码 <b id="trackLang"></b>。
+          启用后：每段原文可录入一条译文；原文文字或时间变更会使对应译文失效，需重新校对；
+          发布要求每段原文与译文均已审且译文对应当前原文。</p>
+        <p class="meta">统计：共 <b id="trackSegCount"></b> 段原文 ｜ 已录译文 <b id="trackEntryCount"></b> 段
+          ｜ 失效 <b id="trackStaleCount"></b> 段 ｜ 译文已审 <b id="trackReviewedCount"></b> 段</p>
+      </div>
+      <div id="trackEnable">
+        <p class="meta">为该视频启用一个指定语言的译文轨道（每个视频至多一个）。语言代码示例：en、zh-CN、ja、pt-BR。</p>
+        <div class="form-row">
+          <label>语言代码
+            <input type="text" id="trackLangInput" placeholder="例如 en" />
+          </label>
+          <button type="button" class="btn primary" id="trackEnableBtn">启用译文轨道</button>
+        </div>
+      </div>
+      <p id="trackError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="trackCancel">关闭</button>
+        <button type="button" class="btn danger hidden" id="trackRemoveBtn">移除译文轨道（清除全部草稿译文）</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>
