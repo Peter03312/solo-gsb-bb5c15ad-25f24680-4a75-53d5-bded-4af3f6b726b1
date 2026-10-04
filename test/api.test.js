@@ -219,6 +219,7 @@ async function main() {
 
   await srtImportTests();
   await restoreTests();
+  await translationTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -610,6 +611,251 @@ async function restoreTests() {
   r = await req('POST', `/videos/${rv2.id}/restore/confirm`, { version: 1, start_ms: 0, end_ms: 2000, token: rv2Token });
   check('版本被删后确认 -> 404 且不写入', r.status === 404 && r.json.error.code === 'version_not_found');
   eq('版本缺失零写入', (await getSegs(rv2.id)).length, 1);
+}
+
+async function translationTests() {
+  const getDetail = async (vid) => (await req('GET', `/videos/${vid}`)).json;
+  const getTr = async (vid, sid) => (await getDetail(vid)).translations.find((x) => x.segment_id === sid);
+
+  console.log('15. 译文轨道：启用、唯一语言与未启用保护');
+  const tv = await uploadVideo('译文轨道', 10000, 64);
+  const t1 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '第一句' })).json.segment;
+  const t2 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 3000, end_ms: 4000, text: '第二句' })).json.segment;
+
+  let r = await req('PUT', `/videos/${tv.id}/translation/track`, { language: '' });
+  check('空语言 -> 422', r.status === 422 && r.json.error.code === 'invalid_language');
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'Hello', segment_revision: 1 });
+  check('未启用轨道录入译文 -> 422 no_translation_track', r.status === 422 && r.json.error.code === 'no_translation_track');
+  let srtRes = await fetch(`${BASE}/videos/${tv.id}/srt/translation?version=draft`);
+  check('未启用轨道导出译文 -> 422 no_translation_track',
+    srtRes.status === 422 && (await srtRes.json()).error.code === 'no_translation_track');
+
+  r = await req('PUT', `/videos/${tv.id}/translation/track`, { language: 'en' });
+  check('启用译文轨道 201', r.status === 201 && r.json.translation_lang === 'en', JSON.stringify(r.json));
+  r = await req('PUT', `/videos/${tv.id}/translation/track`, { language: 'en' });
+  check('重复启用同语言幂等 200', r.status === 200 && r.json.already_enabled === true);
+  r = await req('PUT', `/videos/${tv.id}/translation/track`, { language: 'ja' });
+  check('已有轨道时换语言 -> 422 track_exists', r.status === 422 && r.json.error.code === 'track_exists');
+  let detail = await getDetail(tv.id);
+  eq('详情返回轨道语言', detail.translation_lang, 'en');
+  eq('详情返回空译文列表', detail.translations, []);
+
+  console.log('16. 译文录入/审校：双修订号、撤销审校与失效规则');
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First', segment_revision: 999 });
+  check('原文修订号过期 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict');
+  check('409 返回当前原文与译文状态',
+    r.json.error.current && r.json.error.current.segment.id === t1.id && r.json.error.current.translation === null,
+    JSON.stringify(r.json.error));
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First' });
+  check('缺原文修订号 -> 422', r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First', segment_revision: 1 });
+  check('录入译文 201', r.status === 201, JSON.stringify(r.json));
+  eq('新译文待审', r.json.translation.reviewed, false);
+  eq('译文修订号从 1 开始', r.json.translation.revision, 1);
+  eq('新译文未失效', r.json.translation.stale, false);
+  eq('译文绑定当前原文内容', [r.json.translation.source_start_ms, r.json.translation.source_end_ms, r.json.translation.source_text],
+    [1000, 2000, '第一句']);
+
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First!', segment_revision: 1 });
+  check('改译文缺译文修订号 -> 422', r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First!', segment_revision: 1, revision: 9 });
+  check('译文修订号过期 -> 409 并返回当前译文', r.status === 409 && r.json.error.current.translation.text === 'First');
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First!', segment_revision: 1, revision: 1 });
+  check('携带双修订号改译文成功', r.status === 200 && r.json.translation.revision === 2, JSON.stringify(r.json));
+
+  r = await req('POST', `/videos/${tv.id}/segments/${t2.id}/translation/review`, { reviewed: true, segment_revision: 1, revision: 1 });
+  check('审校不存在的译文 -> 404', r.status === 404 && r.json.error.code === 'translation_not_found');
+  r = await req('POST', `/videos/${tv.id}/segments/${t1.id}/translation/review`, { reviewed: true, segment_revision: 1, revision: 1 });
+  check('审校译文旧修订号 -> 409', r.status === 409);
+  r = await req('POST', `/videos/${tv.id}/segments/${t1.id}/translation/review`, { reviewed: true, segment_revision: 1, revision: 2 });
+  check('审校译文成功', r.status === 200 && r.json.translation.reviewed === true);
+  eq('审校后译文修订号递增', r.json.translation.revision, 3);
+
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First!!', segment_revision: 1, revision: 3 });
+  check('修改已审译文成功', r.status === 200);
+  eq('修改译文撤销其审校', r.json.translation.reviewed, false);
+  r = await req('POST', `/videos/${tv.id}/segments/${t1.id}/translation/review`, { reviewed: true, segment_revision: 1, revision: 4 });
+  check('译文再审校成功', r.status === 200 && r.json.translation.reviewed === true);
+
+  // 原文文字改变 -> 译文失效；失效译文不能审校
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}`, { start_ms: 1000, end_ms: 2000, text: '第一句(改)', revision: 1 });
+  check('修改原文文字成功', r.status === 200);
+  eq('原文文字改变后译文失效', (await getTr(tv.id, t1.id)).stale, true);
+  r = await req('POST', `/videos/${tv.id}/segments/${t1.id}/translation/review`, { reviewed: true, segment_revision: 2, revision: 5 });
+  check('失效译文不能审校 -> 422 translation_stale', r.status === 422 && r.json.error.code === 'translation_stale');
+
+  // 重新校对：重新绑定当前原文 -> 不再失效、审校撤销
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'First (revised)', segment_revision: 2, revision: 5 });
+  check('失效后重新校对成功', r.status === 200, JSON.stringify(r.json));
+  eq('重新校对后译文不再失效', r.json.translation.stale, false);
+  eq('重新校对撤销译文审校', r.json.translation.reviewed, false);
+  eq('译文重新绑定新原文', r.json.translation.source_text, '第一句(改)');
+
+  // 仅切换原文审校状态 -> 译文不失效
+  r = await req('POST', `/videos/${tv.id}/segments/${t1.id}/review`, { reviewed: true, revision: 2 });
+  check('原文标记已审', r.status === 200);
+  eq('仅切换原文审校不使译文失效', (await getTr(tv.id, t1.id)).stale, false);
+
+  // 原文时间改变 -> 译文失效
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}`, { start_ms: 1200, end_ms: 2000, text: '第一句(改)', revision: 3 });
+  check('修改原文时间成功', r.status === 200);
+  eq('原文时间改变后译文失效', (await getTr(tv.id, t1.id)).stale, true);
+
+  console.log('17. 删除 / 整稿替换 / 区间恢复不沿用旧译文');
+  r = await req('PUT', `/videos/${tv.id}/segments/${t2.id}/translation`, { text: 'Second', segment_revision: 1 });
+  check('给第二句录译文 201', r.status === 201);
+  r = await req('DELETE', `/videos/${tv.id}/segments/${t2.id}`, { revision: 1 });
+  check('删除片段成功', r.status === 200);
+  check('删除片段后其译文被级联删除', (await getDetail(tv.id)).translations.every((x) => x.segment_id !== t2.id));
+
+  const repl = '1\n00:00:05,000 --> 00:00:06,000\n全新草稿';
+  let p = await srtPreview(tv.id, repl);
+  r = await srtImport(tv.id, repl, 'replace', p.json.token);
+  check('整稿替换成功', r.status === 201);
+  eq('整稿替换后译文全部清空', (await getDetail(tv.id)).translations, []);
+
+  // 区间恢复：恢复产生的新片段不沿用旧译文
+  detail = await getDetail(tv.id);
+  let g = detail.segments[0];
+  r = await req('POST', `/videos/${tv.id}/segments/${g.id}/review`, { reviewed: true, revision: g.revision });
+  check('草稿片段审校', r.status === 200);
+  r = await req('PUT', `/videos/${tv.id}/segments/${g.id}/translation`, { text: 'Brand new', segment_revision: 2 });
+  check('录入译文', r.status === 201);
+  r = await req('POST', `/videos/${tv.id}/segments/${g.id}/translation/review`, { reviewed: true, segment_revision: 2, revision: 1 });
+  check('译文审校', r.status === 200);
+  r = await req('POST', `/videos/${tv.id}/publish`, {});
+  check('双轨齐备发布 v1', r.status === 201 && r.json.publication.has_translation === true, JSON.stringify(r.json));
+  r = await req('PUT', `/videos/${tv.id}/segments/${g.id}`, { start_ms: 5000, end_ms: 6000, text: '全新草稿改', revision: 2 });
+  check('改草稿文字', r.status === 200);
+  r = await req('PUT', `/videos/${tv.id}/segments/${g.id}/translation`, { text: 'Brand new 2', segment_revision: 3, revision: 2 });
+  check('重新校对译文', r.status === 200);
+  r = await req('POST', `/videos/${tv.id}/segments/${g.id}/translation/review`, { reviewed: true, segment_revision: 3, revision: 3 });
+  check('译文再审校', r.status === 200);
+  g = (await getDetail(tv.id)).segments[0];
+  r = await req('POST', `/videos/${tv.id}/segments/${g.id}/review`, { reviewed: true, revision: g.revision });
+  check('原文再审校', r.status === 200);
+  r = await req('POST', `/videos/${tv.id}/publish`, {});
+  check('发布 v2', r.status === 201 && r.json.publication.version === 2);
+  p = await req('POST', `/videos/${tv.id}/restore/preview`, { version: 1, start_ms: 0, end_ms: 10000 });
+  check('恢复预览 200', p.status === 200, JSON.stringify(p.json));
+  r = await req('POST', `/videos/${tv.id}/restore/confirm`, { version: 1, start_ms: 0, end_ms: 10000, token: p.json.token });
+  check('恢复确认 201', r.status === 201, JSON.stringify(r.json));
+  eq('恢复产生的新片段不沿用旧译文', (await getDetail(tv.id)).translations, []);
+
+  console.log('18. 双轨发布门禁与快照固定');
+  const gv = await uploadVideo('双轨门禁', 8000, 48);
+  await req('PUT', `/videos/${gv.id}/translation/track`, { language: 'zh-Hans' });
+  const g1 = (await req('POST', `/videos/${gv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '原文一' })).json.segment;
+  await req('POST', `/videos/${gv.id}/segments/${g1.id}/review`, { reviewed: true, revision: 1 });
+
+  r = await req('POST', `/videos/${gv.id}/publish`, {});
+  check('缺译文不能发布 -> 422', r.status === 422 && r.json.error.code === 'not_publishable');
+  check('失败返回待处理片段（缺译文）',
+    Array.isArray(r.json.error.pending) && r.json.error.pending[0].segment_id === g1.id &&
+    r.json.error.pending[0].reasons.includes('translation_missing'), JSON.stringify(r.json.error));
+  eq('未生成部分版本', (await req('GET', `/videos/${gv.id}/publications`)).json.publications, []);
+
+  r = await req('PUT', `/videos/${gv.id}/segments/${g1.id}/translation`, { text: '译文一', segment_revision: 2 });
+  check('录入译文', r.status === 201);
+  r = await req('POST', `/videos/${gv.id}/publish`, {});
+  check('译文未审不能发布', r.status === 422 && r.json.error.pending[0].reasons.includes('translation_unreviewed'));
+  eq('仍未生成部分版本', (await req('GET', `/videos/${gv.id}/publications`)).json.publications.length, 0);
+
+  r = await req('POST', `/videos/${gv.id}/segments/${g1.id}/translation/review`, { reviewed: true, segment_revision: 2, revision: 1 });
+  check('译文审校', r.status === 200);
+  r = await req('GET', `/videos/${gv.id}/status`);
+  check('状态接口报告双轨齐备可发布', r.json.canPublish === true && r.json.translation.language === 'zh-Hans' &&
+    r.json.translation.reviewed === 1 && r.json.translation.missing === 0, JSON.stringify(r.json));
+  r = await req('POST', `/videos/${gv.id}/publish`, {});
+  check('双轨齐备发布 v1', r.status === 201 && r.json.publication.has_translation === true &&
+    r.json.publication.translation_lang === 'zh-Hans', JSON.stringify(r.json));
+
+  // 快照固定两轨：发布后改草稿译文，已发布译文 SRT 不变
+  r = await req('PUT', `/videos/${gv.id}/segments/${g1.id}/translation`, { text: '译文一(改)', segment_revision: 2, revision: 2 });
+  check('发布后改草稿译文', r.status === 200);
+  let srt = await (await fetch(`${BASE}/videos/${gv.id}/srt/translation?version=published`)).text();
+  check('已发布译文快照不可变', /译文一/.test(srt) && !/译文一\(改\)/.test(srt));
+  srt = await (await fetch(`${BASE}/videos/${gv.id}/srt/translation?version=draft`)).text();
+  check('草稿译文 SRT 反映最新修改', /译文一\(改\)/.test(srt));
+  srt = await (await fetch(`${BASE}/videos/${gv.id}/srt?version=1`)).text();
+  check('单语原文 SRT 导出不变', /原文一/.test(srt) && !/译文一/.test(srt));
+
+  // 原文变更 -> 译文失效 -> 阻塞发布；原文未审同样阻塞
+  r = await req('PUT', `/videos/${gv.id}/segments/${g1.id}`, { start_ms: 1000, end_ms: 2000, text: '原文一(改)', revision: 2 });
+  check('改原文使译文失效', r.status === 200);
+  r = await req('POST', `/videos/${gv.id}/publish`, {});
+  check('译文失效阻塞发布', r.status === 422 && r.json.error.pending[0].reasons.includes('translation_stale'));
+  r = await req('PUT', `/videos/${gv.id}/segments/${g1.id}/translation`, { text: '译文一(再改)', segment_revision: 3, revision: 3 });
+  check('重新校对译文', r.status === 200);
+  r = await req('POST', `/videos/${gv.id}/segments/${g1.id}/translation/review`, { reviewed: true, segment_revision: 3, revision: 4 });
+  check('译文审校', r.status === 200);
+  r = await req('POST', `/videos/${gv.id}/publish`, {});
+  check('原文未审阻塞发布', r.status === 422 && r.json.error.pending[0].reasons.includes('segment_unreviewed'));
+  r = await req('POST', `/videos/${gv.id}/segments/${g1.id}/review`, { reviewed: true, revision: 3 });
+  check('原文审校', r.status === 200);
+  r = await req('POST', `/videos/${gv.id}/publish`, {});
+  check('再次齐备发布 v2', r.status === 201 && r.json.publication.version === 2);
+
+  console.log('19. 译文 SRT 导出：缺失/失效拒绝并指出片段');
+  const ev = await uploadVideo('译文导出', 5000, 48);
+  await req('PUT', `/videos/${ev.id}/translation/track`, { language: 'en' });
+  const e1 = (await req('POST', `/videos/${ev.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '甲' })).json.segment;
+
+  srtRes = await fetch(`${BASE}/videos/${ev.id}/srt/translation?version=draft`);
+  let ej = await srtRes.json();
+  check('草稿缺译文 -> 422 translation_incomplete', srtRes.status === 422 && ej.error.code === 'translation_incomplete');
+  check('指出缺失片段', ej.error.pending[0].segment_id === e1.id && ej.error.pending[0].reason === 'translation_missing');
+
+  await req('PUT', `/videos/${ev.id}/segments/${e1.id}/translation`, { text: 'Alpha', segment_revision: 1 });
+  await req('PUT', `/videos/${ev.id}/segments/${e1.id}`, { start_ms: 1000, end_ms: 2000, text: '甲乙', revision: 1 });
+  srtRes = await fetch(`${BASE}/videos/${ev.id}/srt/translation?version=draft`);
+  ej = await srtRes.json();
+  check('译文失效 -> 422 并指出片段', srtRes.status === 422 && ej.error.pending[0].reason === 'translation_stale' &&
+    ej.error.pending[0].segment_id === e1.id, JSON.stringify(ej));
+
+  await req('PUT', `/videos/${ev.id}/segments/${e1.id}/translation`, { text: 'Alpha Beta', segment_revision: 2, revision: 1 });
+  srtRes = await fetch(`${BASE}/videos/${ev.id}/srt/translation?version=draft`);
+  srt = await srtRes.text();
+  check('齐备草稿译文 SRT 可导出', srtRes.status === 200 && /Alpha Beta/.test(srt) && !/甲乙/.test(srt), srt);
+  check('译文 SRT 时间戳正确', /00:00:01,000 --> 00:00:02,000/.test(srt));
+  check('文件名携带语言标记', (srtRes.headers.get('content-disposition') || '').includes('.en.srt'));
+
+  srtRes = await fetch(`${BASE}/videos/${ev.id}/srt/translation?version=published`);
+  check('无发布版本 -> 404', srtRes.status === 404 && (await srtRes.json()).error.code === 'no_publication');
+  srtRes = await fetch(`${BASE}/videos/${ev.id}/srt/translation?version=99`);
+  check('版本不存在 -> 404', srtRes.status === 404 && (await srtRes.json()).error.code === 'version_not_found');
+  srtRes = await fetch(`${BASE}/videos/${ev.id}/srt/translation?version=abc`);
+  check('非法版本参数 -> 422', srtRes.status === 422 && (await srtRes.json()).error.code === 'invalid_version');
+
+  // 未启用轨道时发布的旧版本不含译文快照
+  const wv = await uploadVideo('纯原文视频', 5000, 48);
+  const w1 = (await req('POST', `/videos/${wv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '仅原文' })).json.segment;
+  await req('POST', `/videos/${wv.id}/segments/${w1.id}/review`, { reviewed: true, revision: 1 });
+  r = await req('POST', `/videos/${wv.id}/publish`, {});
+  check('无轨道视频按单语门禁发布 v1', r.status === 201 && r.json.publication.has_translation === false);
+  srtRes = await fetch(`${BASE}/videos/${wv.id}/srt/translation?version=1`);
+  check('旧发布版本无译文 -> 422 translation_unavailable',
+    srtRes.status === 422 && (await srtRes.json()).error.code === 'translation_unavailable');
+  srtRes = await fetch(`${BASE}/videos/${wv.id}/srt/translation?version=published`);
+  check('最新发布同样无译文 -> 422', srtRes.status === 422);
+
+  console.log('20. 停用译文轨道：删除全部译文并恢复单语门禁');
+  r = await req('DELETE', `/videos/${ev.id}/translation/track`);
+  check('停用轨道 204', r.status === 204);
+  detail = await getDetail(ev.id);
+  eq('停用后轨道语言清空', detail.translation_lang, null);
+  eq('停用后译文全部删除', detail.translations, []);
+  r = await req('DELETE', `/videos/${ev.id}/translation/track`);
+  check('重复停用 -> 404', r.status === 404 && r.json.error.code === 'no_translation_track');
+  r = await req('PUT', `/videos/${ev.id}/translation/track`, { language: 'ja' });
+  check('停用后可启用其它语言', r.status === 201 && r.json.translation_lang === 'ja');
+  r = await req('DELETE', `/videos/${ev.id}/translation/track`);
+  check('再次停用 204', r.status === 204);
+  // 停用后回到单语门禁：审校原文即可发布，且新版本不含译文快照
+  const e1cur = (await getDetail(ev.id)).segments.find((x) => x.id === e1.id);
+  await req('POST', `/videos/${ev.id}/segments/${e1.id}/review`, { reviewed: true, revision: e1cur.revision });
+  r = await req('POST', `/videos/${ev.id}/publish`, {});
+  check('停用轨道后按单语门禁发布', r.status === 201 && r.json.publication.has_translation === false, JSON.stringify(r.json));
 }
 
 const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {

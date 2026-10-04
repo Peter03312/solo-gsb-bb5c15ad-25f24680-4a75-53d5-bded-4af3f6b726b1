@@ -150,6 +150,27 @@
     </div>
   </div>
 
+  <!-- 译文编辑弹窗 -->
+  <div id="trModal" class="modal hidden">
+    <div class="modal-card">
+      <h3 id="trTitle">录入译文</h3>
+      <p class="meta">片段 #<span id="trSegId"></span> ｜ 所见原文修订号 <b id="trSegRev"></b> ｜ 译文修订号 <b id="trRev"></b>
+        <span id="trStaleNote" class="warn hidden">（原文已变更，译文已失效；请按当前原文重新校对）</span>
+        <span id="trReviewNote" class="warn hidden">（译文已审；保存修改将撤销译文审校状态）</span></p>
+      <label class="block">当前原文（只读）
+        <pre id="trSource" class="tr-source"></pre>
+      </label>
+      <label class="block">译文（<span id="trLang"></span>）
+        <textarea id="trText" rows="4" placeholder="输入该段原文的译文…"></textarea>
+      </label>
+      <p id="trError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="trCancel">取消</button>
+        <button type="button" class="btn primary" id="trSave">保存译文</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>

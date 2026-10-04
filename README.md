@@ -19,6 +19,14 @@
 - **审校流**：片段有 `待审 / 已审` 状态；**修改已审片段的内容会自动撤销其审校状态**（仅切换审校状态不会）。
 - **发布门禁**：至少 1 个片段、全部已审、时间全部合法才能发布。
 - **不可变版本**：发布把当前片段整体快照存库；之后的编辑只影响草稿，历史发布版本永不改变。
+- **译文轨道（单语言）**：每个视频可启用一个指定语言的译文轨道，译文逐段关联当前草稿原文片段：
+  - 录入/修改/审校译文须同时提交**所见原文修订号 `segment_revision` 与译文修订号 `revision`**，过期拒绝（`409`）并返回当前原文与译文状态；
+  - **修改译文会撤销其审校状态**；原文的**文字或时间**一旦被修改，对应译文即标记为**已失效**（仅切换原文审校状态不会），需按当前原文重新校对；
+  - 删除片段、SRT 整稿替换、历史区间恢复产生的新片段**不沿用旧译文**（级联清除）；
+  - 工作台片段表并列展示原文与译文两轨的待审/已审/已失效状态，可直接录入、修改、审校译文；
+  - 启用轨道的视频只有在**每段原文已审、译文已审且译文对应当前原文**时才能发布；失败返回待处理片段清单，不生成部分版本；
+  - 发布快照**同时固定两轨内容**；原有单语 SRT 导出与旧发布版本（无译文快照）完全不变；
+  - 可导出**草稿**或**含译文的发布版本**的译文 SRT；译文缺失或失效时拒绝（`422`）并逐段指出。
 - **SRT 导出**：下载时可选择「草稿」「最新已发布」或任意历史版本（`?version=draft|published|<版本号>`）。
 - **SRT 导入（预览 → 确认）**：为已有视频导入本地 SRT：
   - 接受 UTF-8（可含 BOM）、CRLF/LF 混用、序号不连续、多行文本的标准 SRT；
@@ -72,7 +80,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入与历史版本区间恢复等 166 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出等 263 个断言）：
 
 ```bash
 npm test
@@ -108,12 +116,16 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 5. 需要把某段字幕回退到历史版本时，点「↩ 区间恢复…」：选择已发布版本并填写整数毫秒区间，
    「预览恢复」后并列核对区间内发布快照与当前草稿、以及将移除/恢复的清单，再「确认恢复」；
    恢复片段为待审，需重新审校后才能再次发布。
-6. 右侧「发布与下载」面板实时列出阻塞发布的问题；全部满足后点「发布新版本」。
-7. 用「下载 SRT ▾」选择草稿或任一已发布版本导出。
+6. 需要译文时，在右侧「发布与下载」面板输入语言（如 `en`）启用译文轨道：片段表随即出现译文列，
+   逐段「录译文/改译文」并按当前原文审校；原文被改动后对应译文显示「已失效」，重新保存译文即完成重新校对。
+7. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/待审/已失效）；全部满足后点「发布新版本」，
+   启用轨道时发布会同时固定原文与译文两轨快照。
+8. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
 
 ## HTTP API 摘要
 
-所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认改持预览令牌 `token`）。
+所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认改持预览令牌 `token`；
+译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -132,7 +144,12 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `POST` | `/api/videos/:id/srt/import` | 确认写入：multipart 或 JSON 携带 `srt`/`content`、`mode=append\|replace`、预览返回的 `token` |
 | `POST` | `/api/videos/:id/restore/preview` | 预览区间恢复 `{version,start_ms,end_ms}`，返回两侧片段清单（`to_restore`/`to_remove`）与确认令牌 `token` |
 | `POST` | `/api/videos/:id/restore/confirm` | 确认区间恢复 `{version,start_ms,end_ms,token}`，事务内整批替换 |
-| `GET` | `/api/videos/:id/srt?version=` | 导出 SRT：`draft`（默认）/ `published` / `1` 等版本号 |
+| `GET` | `/api/videos/:id/srt?version=` | 导出原文 SRT：`draft`（默认）/ `published` / `1` 等版本号 |
+| `PUT` | `/api/videos/:id/translation/track` | 启用译文轨道 `{language}`（同一视频仅一个语言；同语言重复调用幂等） |
+| `DELETE` | `/api/videos/:id/translation/track` | 停用译文轨道并删除草稿全部译文（已发布快照不受影响） |
+| `PUT` | `/api/videos/:id/segments/:sid/translation` | 录入/修改译文 `{text,segment_revision,revision?（已有译文时必填）}`；修改撤销译文审校 |
+| `POST` | `/api/videos/:id/segments/:sid/translation/review` | 译文审校切换 `{reviewed,segment_revision,revision}`；已失效译文拒绝审校 |
+| `GET` | `/api/videos/:id/srt/translation?version=` | 导出译文 SRT：`draft`（默认，需齐备且未失效）/ `published` / 版本号（需该版本含译文快照） |
 
 错误响应统一为 `{ "error": { "code", "message", "current?" } }`：
 `422` 为非法修改（含原因），`409` 为修订冲突（`current` 为最新片段）。
@@ -272,11 +289,64 @@ curl -s -X POST http://localhost:8080/api/videos/12/restore/confirm \
 | `409 preview_required` | 缺失/伪造/过期（服务重启）的恢复预览令牌，需先预览 |
 | `409 draft_changed` | 预览后草稿被修改（增删改或审校变化）；响应附 `current_segments`，必须重新预览后再确认 |
 
+### 译文轨道调用示例
+
+同一视频仅可启用**一个**指定语言的译文轨道；译文逐段关联当前草稿原文片段。
+所有译文写操作都要携带**两个修订号**：所见原文修订号 `segment_revision` 与所见译文修订号 `revision`
+（首次录入时译文尚不存在，只需 `segment_revision`）；过期返回 `409` 与当前原文/译文状态。
+
+```bash
+V=12  # 视频 id
+
+# 1) 启用译文轨道（换语言须先 DELETE 停用，停用会删除草稿全部译文）
+curl -s -X PUT http://localhost:8080/api/videos/$V/translation/track \
+  -H 'Content-Type: application/json' -d '{"language":"en"}'
+
+# 2) 录入片段 #7 的译文（片段当前修订号 3）
+curl -s -X PUT http://localhost:8080/api/videos/$V/segments/7/translation \
+  -H 'Content-Type: application/json' -d '{"text":"Hello world","segment_revision":3}'
+
+# 3) 修改译文（译文修订号 1；修改会撤销译文审校状态）
+curl -s -X PUT http://localhost:8080/api/videos/$V/segments/7/translation \
+  -H 'Content-Type: application/json' -d '{"text":"Hello, world!","segment_revision":3,"revision":1}'
+
+# 4) 审校译文（双修订号；原文若已变更导致译文失效，会被 422 拒绝，需先重新保存译文）
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/7/translation/review \
+  -H 'Content-Type: application/json' -d '{"reviewed":true,"segment_revision":3,"revision":2}'
+
+# 5) 查看双轨门禁状态（translation 汇总 + pending 待处理片段）
+curl -s http://localhost:8080/api/videos/$V/status
+
+# 6) 发布（启用轨道后要求每段原文已审、译文已审且未失效；失败 422 附 pending，不生成部分版本）
+curl -s -X POST http://localhost:8080/api/videos/$V/publish
+
+# 7) 导出译文 SRT（草稿需译文齐备且未失效；发布版本需含译文快照）
+curl -s -OJ "http://localhost:8080/api/videos/$V/srt/translation?version=draft"
+curl -s -OJ "http://localhost:8080/api/videos/$V/srt/translation?version=1"
+```
+
+译文失效规则：原文的**文字或时间**被修改后，对应译文 `stale=true`（仅切换原文审校状态不会）；
+删除片段、SRT 整稿替换、区间恢复产生的新片段一律没有译文。重新保存译文（`PUT .../translation`）
+即把译文重新绑定到当前原文并清除失效标记，同时撤销其审校状态。
+
+失败约定（在通用错误格式 `{ "error": { "code", "message", ... } }` 之上）：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 no_translation_track` | 未启用译文轨道却进行译文操作/导出 |
+| `422 invalid_language` / `422 track_exists` | 语言非法；已启用其它语言（须先停用） |
+| `404 translation_not_found` | 该片段尚无译文（审校前需先录入） |
+| `409 revision_conflict` | 原文或译文修订号过期；`error.current` 为当前 `{segment, translation}` 状态 |
+| `422 translation_stale` | 译文已失效（原文文字/时间已变），需先重新校对译文 |
+| `422 not_publishable` | 发布门禁未过；`error.pending[]` 逐段给出 `segment_id` 与 `reasons`（`segment_unreviewed` / `translation_missing` / `translation_stale` / `translation_unreviewed`），不生成部分版本 |
+| `422 translation_incomplete` | 草稿译文缺失或失效，无法导出译文 SRT；`error.pending[]` 逐段指出片段与原因 |
+| `422 translation_unavailable` | 指定发布版本不含译文快照（发布时未启用轨道） |
+
 ## 数据布局
 
 ```
 data/
-├── app.db            # SQLite：videos / segments / publications
+├── app.db            # SQLite：videos / segments / translations / publications
 └── videos/           # 上传的原始视频文件（随机化文件名）
 ```
 

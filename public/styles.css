@@ -152,6 +152,7 @@ video { width: 100%; background: #000; border-radius: 8px; max-height: 420px; }
 .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 4px; margin-right: 4px; }
 .tag.ok { background: rgba(52,199,138,.15); color: var(--ok); }
 .tag.warn { background: rgba(240,169,59,.15); color: var(--warn); }
+.tag.bad { background: rgba(239,95,111,.15); color: var(--danger); }
 .tag.rev { background: rgba(147,160,184,.18); color: var(--muted); }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
@@ -198,6 +199,14 @@ tr.import-conflict td { background: rgba(240,169,59,.12); }
 .restore-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
 .restore-compare h4 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
 @media (max-width: 720px) { .restore-compare { grid-template-columns: 1fr; } }
+
+/* 译文轨道 */
+.track-bar { border-top: 1px dashed var(--border); margin-top: 12px; padding-top: 10px; }
+.tr-source {
+  background: var(--panel-2); border-radius: 8px; padding: 10px 14px;
+  white-space: pre-wrap; word-break: break-word; margin: 5px 0 0;
+  font-family: inherit; font-size: 13px; color: var(--text);
+}
 
 /* toast */
 .toast {
